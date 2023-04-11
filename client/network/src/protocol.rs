@@ -75,6 +75,13 @@ mod rep {
 type PendingSyncSubstreamValidation =
 	Pin<Box<dyn Future<Output = Result<(PeerId, Roles), PeerId>> + Send>>;
 
+type PendingInboundSyncSubstreamValidation = Pin<
+	Box<
+		dyn Future<Output = Result<(PeerId, sc_peerset::IncomingIndex), sc_peerset::IncomingIndex>>
+			+ Send,
+	>,
+>;
+
 // Lock must always be taken in order declared here.
 pub struct Protocol<B: BlockT> {
 	/// Pending list of messages to return from `poll` as a priority.
@@ -95,6 +102,7 @@ pub struct Protocol<B: BlockT> {
 	/// Connected peers.
 	peers: HashMap<PeerId, Roles>,
 	sync_substream_validations: FuturesUnordered<PendingSyncSubstreamValidation>,
+	sync_substream_inbound_validations: FuturesUnordered<PendingInboundSyncSubstreamValidation>,
 	tx: TracingUnboundedSender<crate::event::SyncEvent<B>>,
 	_marker: std::marker::PhantomData<B>,
 }
@@ -190,6 +198,7 @@ impl<B: BlockT> Protocol<B> {
 			bad_handshake_substreams: Default::default(),
 			peers: HashMap::new(),
 			sync_substream_validations: FuturesUnordered::new(),
+			sync_substream_inbound_validations: FuturesUnordered::new(),
 			tx,
 			// TODO: remove when `BlockAnnouncesHandshake` is moved away from `Protocol`
 			_marker: Default::default(),
@@ -431,6 +440,23 @@ impl<B: BlockT> NetworkBehaviour for Protocol<B> {
 		};
 
 		while let Poll::Ready(Some(validation_result)) =
+			self.sync_substream_inbound_validations.poll_next_unpin(cx)
+		{
+			match validation_result {
+				Ok((peer, index)) => {
+					self.behaviour.accept_inbound_substream(peer, index);
+				},
+				Err(index) => {
+					log::debug!(
+						target: "sub-libp2p",
+						"`SyncingEngine` rejected stream"
+					);
+					self.behaviour.peerset_report_reject(index);
+				},
+			}
+		}
+
+		while let Poll::Ready(Some(validation_result)) =
 			self.sync_substream_validations.poll_next_unpin(cx)
 		{
 			match validation_result {
@@ -448,6 +474,95 @@ impl<B: BlockT> NetworkBehaviour for Protocol<B> {
 		}
 
 		let outcome = match event {
+			NotificationsOut::ValidateSubstream { peer_id, index, received_handshake } => {
+				// `received_handshake` can be either a `Status` message if received from the
+				// legacy substream ,or a `BlockAnnouncesHandshake` if received from the block
+				// announces substream.
+				match <Message<B> as DecodeAll>::decode_all(&mut &received_handshake[..]) {
+					Ok(GenericMessage::Status(handshake)) => {
+						let handshake = BlockAnnouncesHandshake::<B> {
+							roles: handshake.roles,
+							best_number: handshake.best_number,
+							best_hash: handshake.best_hash,
+							genesis_hash: handshake.genesis_hash,
+						};
+
+						let (tx, rx) = oneshot::channel();
+						let _ = self.tx.unbounded_send(crate::SyncEvent::ValidateSubstream {
+							remote: peer_id,
+							received_handshake: handshake,
+							tx,
+						});
+						self.sync_substream_inbound_validations.push(Box::pin(async move {
+							match rx.await {
+								Ok(accepted) =>
+									if accepted {
+										Ok((peer_id, index))
+									} else {
+										Err(index)
+									},
+								Err(_) => Err(index),
+							}
+						}));
+
+						CustomMessageOutcome::None
+					},
+					Ok(msg) => {
+						debug!(
+							target: "sync",
+							"Expected Status message from {}, but got {:?}",
+							peer_id,
+							msg,
+						);
+						self.behaviour.peerset_report_reject(index);
+						CustomMessageOutcome::None
+					},
+					Err(err) => {
+						match <BlockAnnouncesHandshake<B> as DecodeAll>::decode_all(
+							&mut &received_handshake[..],
+						) {
+							Ok(handshake) => {
+								let roles = handshake.roles;
+								self.peers.insert(peer_id, roles);
+
+								let (tx, rx) = oneshot::channel();
+								let _ =
+									self.tx.unbounded_send(crate::SyncEvent::ValidateSubstream {
+										remote: peer_id,
+										received_handshake: handshake,
+										tx,
+									});
+								self.sync_substream_inbound_validations.push(Box::pin(
+									async move {
+										match rx.await {
+											Ok(accepted) =>
+												if accepted {
+													Ok((peer_id, index))
+												} else {
+													Err(index)
+												},
+											Err(_) => Err(index),
+										}
+									},
+								));
+								CustomMessageOutcome::None
+							},
+							Err(err2) => {
+								log::debug!(
+									target: "sync",
+									"Couldn't decode handshake sent by {}: {:?}: {} & {}",
+									peer_id,
+									received_handshake,
+									err,
+									err2,
+								);
+								self.behaviour.peerset_report_reject(index);
+								CustomMessageOutcome::None
+							},
+						}
+					},
+				}
+			},
 			NotificationsOut::CustomProtocolOpen {
 				peer_id,
 				set_id,
